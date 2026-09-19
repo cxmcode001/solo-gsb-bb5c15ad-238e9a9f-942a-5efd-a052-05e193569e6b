@@ -12,6 +12,7 @@
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
+- **持久化主题发布（pub/sub）**：`PUT /subscriptions/{id}/topics` 以替换语义维护订阅的去重主题集合（`GET` 查询、空列表清空）；`POST /topic-events` 提交 `event_id`、`topic`、`payload`，在**单个 SQLite 事务**中快照该主题当前全部订阅并为每个订阅生成一条普通投递任务（任务随后完全复用有序、限流、熔断、重试链路）。幂等键为 `(event_id, topic, payload)`：相同三元组重放返回**首次**收件人与任务结果（即使主题成员已变化也不新增、不漏投）；同一 `event_id` 主题不同或内容不同返回 `409`；主题无订阅者返回 `422` 且不落库；主题事件与 `POST /events`、`POST /ingest` 共享事件 ID 命名空间，跨通道复用同一 ID 互返 `409`
 - **事件投递**：一次提交可指定多个订阅，每个订阅生成独立任务
 - **事件级撤销**：`POST /events/{id}/cancel` 在单个 SQLite 原子事务中仅撤销尚未被工作器认领（`pending`）的投递任务；已在投递中（`in_progress`）或已结束（`delivered`/`failed`）的任务保持原结果。被撤销任务进入终态 `cancelled`：不再重试、不参与熔断计数、不阻塞同订阅后续任务；响应返回各类数量，重复撤销幂等，不存在的事件返回 `404`，撤销状态在 `GET /events/{id}` 中明确展示
 - **按订阅严格有序**：同一订阅的任务按 `task_id` 升序（即提交顺序）依次投递——前一条任务处于 `pending`/`in_progress` 时后续任务不会被认领，前一条 `delivered` 或 `failed` 后才放行下一条；不同订阅之间互不影响，仍可由多个工作器并行投递
@@ -76,6 +77,14 @@ curl -s -X PUT http://localhost:8000/subscriptions/$SID/rate-policy \
   -H 'Content-Type: application/json' -d '{"rate_per_second": 1, "burst": 1}'
 curl -s http://localhost:8000/subscriptions/$SID/rate-policy
 curl -s -X DELETE http://localhost:8000/subscriptions/$SID/rate-policy -o /dev/null -w '%{http_code}\n'
+
+# 主题发布：订阅加入主题 → 向主题发布 → 重放返回首次快照（即使成员变化）
+curl -s -X PUT http://localhost:8000/subscriptions/$SID/topics \
+  -H 'Content-Type: application/json' -d '{"topics": ["orders", "billing"]}'
+curl -s http://localhost:8000/subscriptions/$SID/topics
+curl -s -X POST http://localhost:8000/topic-events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id": "evt-topic-1", "topic": "orders", "payload": {"order_id": 42}}'
 ```
 
 ## API 使用示例
@@ -424,7 +433,75 @@ curl -s -X DELETE http://localhost:8000/subscriptions/44a79d7077ce/rate-policy -
 - **校验错误**：`rate_per_second ≤ 0`、`burst < 1`、超出上限均返回 `422`。
 - **订阅视图**：`GET /subscriptions` 与 `GET /subscriptions/{id}` 的每个订阅都带 `rate_per_second` 与 `burst`（未配置时为 `null`）；实时余额请通过专用 `GET …/rate-policy` 查询。
 
-### 10. 投递审计查询
+### 10. 持久化主题发布（pub/sub）
+
+主题是持久化的订阅分组：先让订阅加入主题，再向主题发布事件，中继会在发布瞬间快照主题成员并为每个成员生成一条普通投递任务。
+
+#### 维护订阅的主题集合（PUT / GET /subscriptions/{id}/topics）
+
+```bash
+# 替换语义：整体替换该订阅的主题集合（自动 trim、去重；空列表 = 退出全部主题）
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/topics \
+  -H 'Content-Type: application/json' \
+  -d '{"topics": ["orders", "billing", "orders"]}'
+```
+
+```json
+{"subscription_id": "44a79d7077ce", "topics": ["billing", "orders"]}
+```
+
+```bash
+# 查询当前集合（始终排序、去重）
+curl -s http://localhost:8000/subscriptions/44a79d7077ce/topics
+# {"subscription_id": "44a79d7077ce", "topics": ["billing", "orders"]}
+
+# 退出全部主题
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/topics \
+  -H 'Content-Type: application/json' -d '{"topics": []}'
+```
+
+行为约定：
+
+- **替换而非合并**：`PUT` 在单个 SQLite 事务中删除该订阅的全部旧成员关系后重新写入；响应返回规范化后的**排序去重**集合。
+- **仅影响未来发布**：改主题集合不会影响已经发布的事件——每个事件的收件人在发布时已快照固定。
+- **删除订阅级联清退**：`DELETE /subscriptions/{id}` 会在同一事务中把该订阅从所有主题集合移除（历史投递任务仍保留）。
+- **错误码**：订阅不存在返回 `404`；主题名为空、trim 后超过 128 字符、去重后超过 100 个主题返回 `422`。
+- **持久化**：成员关系存储在 SQLite 的 `subscription_topics` 表中，服务（或容器）重启后保持。
+
+#### 发布主题事件（POST /topic-events）
+
+```bash
+curl -s -X POST http://localhost:8000/topic-events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id": "evt-topic-001", "topic": "orders", "payload": {"order_id": 42, "state": "paid"}}'
+```
+
+```json
+{
+  "event_id": "evt-topic-001",
+  "topic": "orders",
+  "payload": {"order_id": 42, "state": "paid"},
+  "replayed": false,
+  "recipients": [
+    {"task_id": 11, "subscription_id": "44a79d7077ce", "status": "pending", "deliver_at": null},
+    {"task_id": 12, "subscription_id": "94d3c624dad2", "status": "pending", "deliver_at": null}
+  ]
+}
+```
+
+`recipients` 即发布瞬间该主题成员的快照，每个收件人对应一条**普通投递任务**（与 `POST /events` 生成的任务完全相同）。行为约定：
+
+- **单事务快照发布**：幂等检查 → 读取主题成员 → 写事件 → 为每个成员建任务 → 写发布记录，全部在同一个 SQLite 事务（`BEGIN IMMEDIATE` + 连接锁）内完成；并发发布/并发成员修改在数据库层被串行化，快照不可能取到“半个集合”。
+- **生成的是普通任务**：主题任务复用现有全部投递语义——按订阅 `task_id` 严格有序、令牌桶限流（每次认领扣令牌）、熔断器（连续失败熔断、half-open 探针）、指数退避重试、暂停/恢复、`POST /events/{id}/cancel` 撤销、崩溃恢复与审计查询；worker 代码对任务来源无感知。
+- **精确重放（200）**：以 `(event_id, topic, payload)` 为幂等键，三元组完全相同的重放返回**首次发布时存储的回执**——相同的收件人集合、相同的 `task_id`（回执为首次状态的存档；需要实时状态请用 `GET /events/{event_id}`），响应 `replayed=true`，**即使期间主题成员已新增或移除，也不会新增或漏掉任何任务**；并发重放同样只有一个请求真正建任务。
+- **内容/主题冲突（409）**：同一 `event_id` 已发布过但 `topic` 不同（409，提示已发布到其它主题）或 `payload` 不同（409，提示内容不同），不产生任何任务。
+- **跨通道冲突（409）**：主题事件与 `POST /events`、`POST /ingest` 共享事件 ID 命名空间：`event_id` 已被直接事件/入站事件使用时发布返回 `409`；反之，已发布的主题事件 ID 再用于 `POST /events` 或 `POST /ingest` 同样返回 `409`。
+- **空收件人（422）**：发布时该主题没有任何订阅者，返回 `422 Unprocessable Entity`，且**事件、发布记录、任务一律不落库**；之后有订阅者加入主题再用同一 `event_id` 发布仍属首次发布。
+- **校验错误（422）**：`event_id` / `topic` 为空或超长（上限 128 字符）、`payload` 不是 JSON 对象，均返回 `422`。
+- **状态与审计**：主题事件的 `event_id` 可直接用于 `GET /events/{id}`（各收件任务的实时状态、尝试历史、`counts`）、`POST /events/{id}/cancel` 以及 `GET /audit/deliveries`；出站投递的请求体即规范化后的 `payload` JSON，并按收件订阅自己的密钥签名。
+- **首次/重放状态码**：首次发布 `201 Created`（`replayed=false`）；精确重放 `200 OK`（`replayed=true`）。
+
+### 11. 投递审计查询
 
 跨事件、跨订阅的投递任务审计视图，只读、不影响投递行为。
 
@@ -531,7 +608,10 @@ curl -s http://localhost:8000/audit/deliveries/12
 | `PUT` | `/subscriptions/{id}/rate-policy` | 设置/替换按订阅令牌桶限流策略（`rate_per_second` + `burst`，桶重置为满，不存在返回 404） |
 | `GET` | `/subscriptions/{id}/rate-policy` | 查询限流策略与实时桶余额、下一令牌时间（未配置时 `enabled=false`） |
 | `DELETE` | `/subscriptions/{id}/rate-policy` | 关闭按订阅限流（清空桶配置，重复删除或未配置返回 404） |
-| `DELETE` | `/subscriptions/{id}` | 删除订阅（已有任务保留历史） |
+| `PUT` | `/subscriptions/{id}/topics` | 替换订阅的去重主题集合（空列表清空，不存在返回 404） |
+| `GET` | `/subscriptions/{id}/topics` | 查询订阅的当前主题集合（排序去重，不存在返回 404） |
+| `POST` | `/topic-events` | 向主题当前全部订阅者发布事件（单事务快照；精确重放返回首次结果，冲突 409，空主题 422） |
+| `DELETE` | `/subscriptions/{id}` | 删除订阅（级联退出全部主题；已有任务保留历史） |
 | `GET` | `/audit/deliveries` | 投递任务审计列表（按订阅/事件/状态/UTC 时间范围过滤，游标分页，按更新时间倒序） |
 | `GET` | `/audit/deliveries/{task_id}` | 单个投递任务的完整审计视图（含全部尝试记录，不存在返回 404） |
 | `GET` | `/healthz` | 健康检查 |
@@ -591,6 +671,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **事件级撤销**：`tasks.status` 增加终态 `cancelled` 并新增 `cancelled_at` 列（新建库直接具备；老库启动迁移时按 SQLite 官方表重建流程——`foreign_keys=OFF`、单个显式事务内建新表、拷贝数据、DROP、RENAME、重建 `tasks` 上的两个索引——自动升级，既有任务数据原样保留）。`POST /events/{id}/cancel` 调用的 `cancel_event` 在连接锁保护的单个事务中执行：事件不存在直接返回 `None`（API 返回 `404`）；否则一条 `UPDATE ... WHERE event_id=? AND status='pending'` 原子地只撤销尚未认领的任务（写入 `cancelled_at`、清空 `next_attempt_at`/`claimed_by`），`in_progress` 与已结束任务不在 WHERE 命中范围内、结果不变；随后按状态 `GROUP BY` 计数返回。由于认领查询只选 `pending` 且有序约束只盯 `pending`/`in_progress`，撤销行既不会被重试、也不会阻塞同订阅后续任务；撤销从不经过 `finish_attempt`，故完全不触碰熔断器记账。唯一需要修复的边角是 half-open 探针在两次尝试之间回到 `pending` 时被撤销：同一事务内把该订阅熔断器从 `half_open` 转回 `open`、探针立即到期并清空探针归属，使下一个待投递任务成为替代探针，避免订阅永久卡在 half-open。重复撤销时 UPDATE 命中 0 行，响应 `cancelled=0` 且计数稳定，天然幂等；撤销与工作器认领共用同一把连接锁，并发下每个任务只可能“被认领（投递并记账）”或“被撤销”，不会重复领取也不会状态错乱。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **投递审计查询**：审计接口是 `tasks` / `attempts` 表的只读视图，不新增任何写入路径，投递行为完全不受影响。列表查询固定按 `(updated_at DESC, id DESC)` 排序并采用键集（keyset）分页：游标是上一页最后一行 `(updated_at, id)` 的 base64url 编码（不透明字符串，客户端只需原样回传），下一页以 `WHERE (updated_at, id) < cursor` 续查，因此无需 OFFSET、翻页成本与页深无关，且同一事务批量更新产生的相同 `updated_at`（如事件级撤销）由 `id` 决胜、不会漏行或重复；每页多取一行判断是否存在下一页，`next_cursor` 为 `null` 即末页。`updated_from` / `updated_to` 在 API 层解析为 UTC epoch 秒（要求显式时区，与 `deliver_at` 的校验风格一致）后作为 `updated_at` 的闭区间下推同一查询；游标解码失败、时间范围非法在进入数据库前即返回 `400`。详情查询按任务 ID 联查 `subscriptions`（LEFT JOIN，订阅已删时 `target_url` 为 `null`）并取出该任务的全部 `attempts` 行。
+- **持久化主题发布**：新增两张表（新建库直接具备；老库由启动时 `CREATE TABLE IF NOT EXISTS` 自动创建，不改动任何旧表）：`subscription_topics(subscription_id, topic, created_at)` 以联合主键保存去重成员关系、按 `topic` 建索引；`topic_events(id, topic, payload, receipt, created_at)` 保存发布记录与首次回执。`PUT /subscriptions/{id}/topics` 在单事务内“全删 + 重写”整个集合（替换语义），`DELETE` 订阅在删除订阅的同一事务中级联清退成员关系。`POST /topic-events` 的 `publish_topic_event` 在连接锁保护的一个 `BEGIN IMMEDIATE` 事务中依次执行：①按 `(event_id, topic, payload)` 查 `topic_events`——三元组全等返回存储回执（`duplicate`），topic 不符返回 `('conflict','topic')`，payload 不符返回 `('conflict','payload')`；②查 `events` 表拦截跨通道 ID 复用（`('conflict','channel')`，`POST /events` 侧用 `topic_event_exists`、`POST /ingest` 侧在 `ingest_event` 内做对称检查，因此跨通道冲突在两个方向上都封死）；③快照 `subscription_topics` 中该主题的成员（按 `created_at, subscription_id` 排序，保证收件顺序确定），为空则直接回滚返回 `empty`——API 映射为 422，且事务未写入任何行；④写 `events`（payload 规范化 JSON 存一份，worker 与 `GET /events` 无需区分来源）、逐成员 `INSERT tasks`（普通 pending 任务，`max_attempts`、退避、有序、令牌桶、熔断全部由既有认领/记账逻辑承载）、写 `topic_events`（含首次回执 JSON）。由于任务是普通任务，有序投递天然成立：同订阅的主题任务与其直接事件任务共用一条 `task_id` 队列。重放只读取首次回执、不碰任务表，所以成员集合事后如何变化都不会增删任务；回执中 `recipients` 的任务状态是首次发布时刻（均为 pending）的存档，实时状态由 `GET /events/{id}` 提供。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。
 
 ## 配置项（环境变量）

@@ -246,3 +246,68 @@ class DeliveryTaskDetail(DeliveryTaskSummary):
     cancelled_at: str | None  # set only when the task was cancelled with its event
     created_at: str
     history: list[AttemptOut]
+
+
+class TopicsUpdate(BaseModel):
+    """Body of PUT /subscriptions/{id}/topics.
+
+    The list replaces (not merges) the subscription's deduplicated topic
+    set; an empty list removes the subscription from every topic. Names are
+    trimmed and must stay within 1..128 characters after trimming; at most
+    100 distinct topics per subscription are allowed.
+    """
+
+    topics: list[str] = Field(max_length=100)
+
+    @field_validator("topics")
+    @classmethod
+    def _normalize_topics(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for v in values:
+            if not isinstance(v, str):
+                raise ValueError("topics must be strings")
+            name = v.strip()
+            if not name:
+                raise ValueError("topic names must not be empty")
+            if len(name) > 128:
+                raise ValueError("topic names must be at most 128 characters")
+            normalized.append(name)
+        if len(set(normalized)) > 100:
+            raise ValueError("at most 100 distinct topics per subscription")
+        return normalized
+
+
+class TopicsOut(BaseModel):
+    """Response of GET/PUT /subscriptions/{id}/topics (sorted, deduplicated)."""
+
+    subscription_id: str
+    topics: list[str]
+
+
+class TopicEventCreate(BaseModel):
+    """Body of POST /topic-events.
+
+    The idempotency key is the triple (event_id, topic, payload): replaying
+    the same triple returns the first publication's recipients and task
+    results even if the topic's membership has since changed. The same
+    event_id with a different topic or payload is rejected with 409.
+    """
+
+    event_id: str = Field(min_length=1, max_length=128)
+    topic: str = Field(min_length=1, max_length=128)
+    payload: dict[str, Any]
+
+
+class TopicEventAccepted(BaseModel):
+    """Result of POST /topic-events.
+
+    recipients is the membership snapshotted at first publication with one
+    ordinary delivery task each; an exact replay returns the very same list
+    (same task ids/statuses) and never creates additional tasks.
+    """
+
+    event_id: str
+    topic: str
+    payload: dict[str, Any]
+    replayed: bool  # False on first publication (201), True on an exact replay (200)
+    recipients: list[TaskRef]

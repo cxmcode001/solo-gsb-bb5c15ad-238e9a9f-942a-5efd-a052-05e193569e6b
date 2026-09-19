@@ -77,9 +77,25 @@ CREATE TABLE IF NOT EXISTS ingested_events (
     created_at  REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS subscription_topics (
+    subscription_id TEXT NOT NULL,      -- live routing set; memberships are removed
+    topic           TEXT NOT NULL,      -- together with the subscription on delete
+    created_at      REAL NOT NULL,      -- (delivery task history is still retained)
+    PRIMARY KEY (subscription_id, topic)
+);
+
+CREATE TABLE IF NOT EXISTS topic_events (
+    id          TEXT PRIMARY KEY,       -- shares the global event id namespace
+    topic       TEXT NOT NULL,          -- topic snapshotted at first publication
+    payload     TEXT NOT NULL,          -- canonical JSON, compared verbatim on replay
+    receipt     TEXT NOT NULL,          -- JSON acceptance (snapshot recipients + tasks)
+    created_at  REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks (status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_sub_order ON tasks (subscription_id, id, status);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
+CREATE INDEX IF NOT EXISTS idx_subscription_topics_topic ON subscription_topics (topic);
 """
 
 # Columns returned to the API layer for a subscription (never secret material).
@@ -512,7 +528,70 @@ class Database:
     def delete_subscription(self, sub_id: str) -> bool:
         with self._lock, self._immediate():
             cur = self._conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
+            if cur.rowcount:
+                # Remove the subscription from every topic routing set; its
+                # delivery task history in tasks/attempts is retained.
+                self._conn.execute(
+                    "DELETE FROM subscription_topics WHERE subscription_id = ?", (sub_id,)
+                )
         return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # per-subscription topic sets (persistent pub/sub routing)
+    # ------------------------------------------------------------------
+    def set_subscription_topics(self, sub_id: str, topics: list[str]) -> list[str] | None:
+        """Replace a subscription's deduplicated topic set, atomically.
+
+        The whole set is rewritten in one transaction (delete all, reinsert
+        the supplied topics), so PUT semantics are replace-not-merge.
+        Passing an empty list removes the subscription from every topic.
+        Topics are normalized already by the API layer (trimmed, unique);
+        they are stored and returned sorted for a stable canonical view.
+        Returns the sorted stored set, or None when the subscription does
+        not exist (nothing is written in that case).
+        """
+        now = time.time()
+        ordered = sorted(set(topics))
+        with self._lock, self._immediate():
+            row = self._conn.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "DELETE FROM subscription_topics WHERE subscription_id = ?", (sub_id,)
+            )
+            self._conn.executemany(
+                "INSERT INTO subscription_topics (subscription_id, topic, created_at) VALUES (?, ?, ?)",
+                [(sub_id, t, now) for t in ordered],
+            )
+        return ordered
+
+    def get_subscription_topics(self, sub_id: str) -> list[str] | None:
+        """Return a subscription's sorted topic set, or None if it is missing."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            rows = self._conn.execute(
+                """SELECT st.topic
+                     FROM subscription_topics st
+                     JOIN subscriptions s ON s.id = st.subscription_id
+                    WHERE st.subscription_id = ?
+                    ORDER BY st.topic""",
+                (sub_id,),
+            ).fetchall()
+        return [r["topic"] for r in rows]
+
+    def topic_event_exists(self, event_id: str) -> bool:
+        """Whether the id is already claimed by a topic publication."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM topic_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        return row is not None
 
     # ------------------------------------------------------------------
     # events and tasks
@@ -596,7 +675,15 @@ class Database:
                 return "conflict", None
 
             # An event created via POST /events shares the events namespace.
-            # Treat an incompatible row as a conflict as well.
+            # Treat an incompatible row as a conflict as well. An id already
+            # used by a topic publication is a conflict regardless of body:
+            # topic and non-topic channels must not share an event id.
+            topic_row = self._conn.execute(
+                "SELECT topic, payload FROM topic_events WHERE id = ?", (webhook_id,)
+            ).fetchone()
+            if topic_row is not None:
+                return "conflict", None
+
             existing = self._conn.execute(
                 "SELECT payload FROM events WHERE id = ?", (webhook_id,)
             ).fetchone()
@@ -647,6 +734,119 @@ class Database:
             self._conn.execute(
                 "INSERT INTO ingested_events (id, raw_body, receipt, created_at) VALUES (?, ?, ?, ?)",
                 (webhook_id, raw_body, json.dumps(receipt), now),
+            )
+        return "created", receipt
+
+    def publish_topic_event(
+        self,
+        event_id: str,
+        topic: str,
+        payload: str,
+        max_attempts: int,
+    ) -> tuple[str, dict | str]:
+        """Publish a topic event against a snapshot of the topic's members.
+
+        Everything below runs in one SQLite transaction, so a concurrent
+        replay can never observe a half-written publication:
+
+        1. Idempotency / conflict check on the idempotency key
+           (event_id, topic, payload):
+             - a prior topic publication with the same id + topic + payload
+               replays ("duplicate") and its stored first-time receipt --
+               the snapshotted recipients and their task refs -- is returned
+               verbatim; membership changes never add or drop tasks;
+             - the same event_id with a different topic or payload is a
+               "conflict" (the reason string distinguishes the two);
+             - an id already claimed by POST /events or POST /ingest is a
+               cross-channel "conflict".
+        2. The topic's current membership is snapshotted. With no members
+           nothing at all is written ("empty") and the caller answers 422.
+        3. The event payload is stored once (events table), one ordinary
+           delivery task is created per snapshotted subscription, and the
+           publication record (including the receipt) is persisted. These
+           tasks are plain tasks: ordering, rate limiting, circuit
+           breaking, retries and cancellation all apply unchanged.
+
+        Returns ("created", receipt) | ("duplicate", receipt) |
+                ("conflict", reason: 'payload' | 'topic' | 'channel') |
+                ("empty", "").
+        """
+        now = time.time()
+        with self._lock, self._immediate():
+            row = self._conn.execute(
+                "SELECT topic, payload, receipt FROM topic_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is not None:
+                if row["topic"] != topic:
+                    return "conflict", "topic"
+                if row["payload"] != payload:
+                    return "conflict", "payload"
+                return "duplicate", json.loads(row["receipt"])
+
+            # The global events namespace is shared with POST /events and
+            # POST /ingest; claiming an id that already exists there is a
+            # cross-channel conflict (its recipients would be unrelated).
+            exists = self._conn.execute(
+                "SELECT 1 FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if exists is not None:
+                return "conflict", "channel"
+
+            # Snapshot the membership inside the publication transaction:
+            # the set the tasks are built against can never change
+            # mid-publication, and later membership edits cannot add or
+            # remove tasks for this event (replays return the stored set).
+            members = [
+                r["subscription_id"]
+                for r in self._conn.execute(
+                    """SELECT subscription_id FROM subscription_topics
+                        WHERE topic = ? ORDER BY created_at, subscription_id""",
+                    (topic,),
+                ).fetchall()
+            ]
+            if not members:
+                # Nothing is persisted: no event, no publication record.
+                return "empty", ""
+
+            self._conn.execute(
+                "INSERT INTO events (id, payload, created_at) VALUES (?, ?, ?)",
+                (event_id, payload, now),
+            )
+
+            recipients = []
+            for sid in members:
+                self._conn.execute(
+                    """INSERT INTO tasks
+                           (event_id, subscription_id, status, attempts, max_attempts,
+                            next_attempt_at, created_at, updated_at)
+                       VALUES (?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                    (event_id, sid, max_attempts, now, now, now),
+                )
+                task = self._conn.execute(
+                    "SELECT id, status FROM tasks WHERE event_id = ? AND subscription_id = ?",
+                    (event_id, sid),
+                ).fetchone()
+                # Topic publications are never scheduled, like POST /ingest.
+                recipients.append(
+                    {
+                        "task_id": task["id"],
+                        "subscription_id": sid,
+                        "status": task["status"],
+                        "deliver_at": None,
+                    }
+                )
+
+            receipt = {
+                "event_id": event_id,
+                "topic": topic,
+                "payload": json.loads(payload),
+                "recipients": recipients,
+            }
+            self._conn.execute(
+                """INSERT INTO topic_events (id, topic, payload, receipt, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (event_id, topic, payload, json.dumps(receipt), now),
             )
         return "created", receipt
 

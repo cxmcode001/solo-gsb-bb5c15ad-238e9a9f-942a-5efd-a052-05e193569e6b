@@ -30,6 +30,10 @@ from .schemas import (
     SecretRotationCreate,
     SubscriptionCreate,
     SubscriptionOut,
+    TopicEventAccepted,
+    TopicEventCreate,
+    TopicsOut,
+    TopicsUpdate,
 )
 from .worker import worker_loop
 
@@ -296,6 +300,33 @@ def delete_rate_policy(sub_id: str) -> Response:
     return Response(status_code=204)
 
 
+@app.put("/subscriptions/{sub_id}/topics", response_model=TopicsOut)
+def put_subscription_topics(sub_id: str, body: TopicsUpdate) -> dict:
+    """Replace a subscription's deduplicated topic set.
+
+    The supplied list is normalized (trimmed, deduplicated) and replaces the
+    whole set atomically; pass an empty list to leave every topic. The
+    response carries the canonical sorted set. Membership only affects
+    future publications: events already published keep the recipient
+    snapshot taken at publication time. A subscription removed after
+    publishing keeps its delivery history; deleting a subscription also
+    removes it from every topic set.
+    """
+    topics = app.state.db.set_subscription_topics(sub_id, body.topics)
+    if topics is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return {"subscription_id": sub_id, "topics": topics}
+
+
+@app.get("/subscriptions/{sub_id}/topics", response_model=TopicsOut)
+def get_subscription_topics(sub_id: str) -> dict:
+    """Return a subscription's current sorted, deduplicated topic set."""
+    topics = app.state.db.get_subscription_topics(sub_id)
+    if topics is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return {"subscription_id": sub_id, "topics": topics}
+
+
 # ----------------------------------------------------------------------
 # events
 # ----------------------------------------------------------------------
@@ -308,8 +339,15 @@ def submit_event(body: EventCreate, response: Response) -> dict:
         raise HTTPException(400, f"unknown subscription id(s): {', '.join(unknown)}")
 
     # Store the event once; an identical re-submission is idempotent, a
-    # conflicting payload for the same event_id is rejected.
+    # conflicting payload for the same event_id is rejected. An id already
+    # used by a topic publication is a cross-channel conflict as well.
     payload = json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False)
+    if db.topic_event_exists(body.event_id):
+        raise HTTPException(
+            409,
+            f"event {body.event_id!r} already exists as a topic publication; "
+            "topic events and direct events share the event id namespace",
+        )
     existing = db.get_event_payload(body.event_id)
     if existing is None:
         db.create_event(body.event_id, payload)
@@ -340,6 +378,56 @@ def submit_event(body: EventCreate, response: Response) -> dict:
 
     response.status_code = 201 if created else 200
     return {"event_id": body.event_id, "created": created, "duplicates": duplicates}
+
+
+# ----------------------------------------------------------------------
+# persistent topic publishing
+# ----------------------------------------------------------------------
+@app.post("/topic-events", response_model=TopicEventAccepted)
+def publish_topic_event(body: TopicEventCreate, response: Response) -> dict:
+    """Publish an event to every subscription currently on a topic.
+
+    The topic's membership is snapshotted inside a single SQLite
+    transaction together with the event and the generated delivery tasks,
+    so the recipients are fixed at first-publication time: later topic
+    membership changes never add or drop tasks for this event. The tasks
+    are ordinary delivery tasks and flow through the existing ordering,
+    rate limiting, circuit breaking and retry machinery unchanged.
+
+    The idempotency key is (event_id, topic, payload):
+
+    - an exact replay returns the first publication's recipients and task
+      results (same task ids and statuses), HTTP 200, and creates nothing;
+    - the same event_id with a different topic or payload is 409;
+    - an event_id already used via POST /events or POST /ingest is 409;
+    - a topic with no subscribers is 422 and nothing is persisted.
+    """
+    payload = json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False)
+    status, result = app.state.db.publish_topic_event(
+        body.event_id, body.topic, payload, config.MAX_ATTEMPTS
+    )
+    if status == "conflict":
+        if result == "topic":
+            raise HTTPException(
+                409,
+                f"event {body.event_id!r} was already published to a different topic",
+            )
+        if result == "payload":
+            raise HTTPException(
+                409,
+                f"event {body.event_id!r} was already published with a different payload",
+            )
+        raise HTTPException(
+            409,
+            f"event {body.event_id!r} already exists as a direct/ingested event; "
+            "topic events and direct events share the event id namespace",
+        )
+    if status == "empty":
+        raise HTTPException(422, f"topic {body.topic!r} has no subscribers; nothing was stored")
+
+    response.status_code = 201 if status == "created" else 200
+    result["replayed"] = status == "duplicate"
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -397,7 +485,11 @@ async def ingest_event(request: Request, response: Response) -> dict:
         webhook_id, raw_body, body.subscription_ids, config.MAX_ATTEMPTS
     )
     if status == "conflict":
-        raise HTTPException(409, f"webhook id {webhook_id!r} was already received with a different body")
+        raise HTTPException(
+            409,
+            f"webhook id {webhook_id!r} was already received with a different body, "
+            "or is already used by a topic/direct event",
+        )
     if status == "unknown":
         raise HTTPException(400, f"unknown subscription id(s): {', '.join(result)}")
 
