@@ -24,6 +24,37 @@ class SubscriptionCreate(BaseModel):
         return v
 
 
+class SubscriptionTopicsUpdate(BaseModel):
+    """Body of PUT /subscriptions/{id}/topics: the full replacement topic set.
+
+    Entries are stripped, must be non-empty and at most 128 characters, and
+    are deduplicated server-side; an empty list unsubscribes the
+    subscription from every topic.
+    """
+
+    topics: list[str] = Field(max_length=100)
+
+    @field_validator("topics")
+    @classmethod
+    def _topics_valid(cls, v: list[str]) -> list[str]:
+        cleaned = []
+        for t in v:
+            t = t.strip()
+            if not t:
+                raise ValueError("topics must not contain empty or blank entries")
+            if len(t) > 128:
+                raise ValueError("each topic must be at most 128 characters")
+            cleaned.append(t)
+        return cleaned
+
+
+class SubscriptionTopicsOut(BaseModel):
+    """Response of GET/PUT /subscriptions/{id}/topics (sorted, deduplicated)."""
+
+    subscription_id: str
+    topics: list[str]
+
+
 class SubscriptionOut(BaseModel):
     id: str
     target_url: str
@@ -124,6 +155,26 @@ class EventCreate(BaseModel):
         return dt
 
 
+class TopicEventCreate(BaseModel):
+    """Body of POST /topic-events: publish a payload to a topic.
+
+    The event is delivered to the topic's subscribers as they are at
+    publish time; the snapshot is taken atomically with task creation.
+    """
+
+    event_id: str = Field(min_length=1, max_length=128)
+    topic: str = Field(min_length=1, max_length=128)
+    payload: dict[str, Any]
+
+    @field_validator("topic")
+    @classmethod
+    def _topic_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("topic must not be blank")
+        return v
+
+
 class IngestEvent(BaseModel):
     """Body of an HMAC-protected inbound event on POST /ingest.
 
@@ -148,6 +199,20 @@ class TaskRef(BaseModel):
 
 class EventAccepted(BaseModel):
     event_id: str
+    created: list[TaskRef]
+    duplicates: list[TaskRef]
+
+
+class TopicEventAccepted(BaseModel):
+    """Acceptance receipt of POST /topic-events.
+
+    Replays of the same (event_id, topic, payload) return the receipt
+    stored at first publish, so 'created'/'duplicates' always reflect the
+    original subscriber snapshot, not the current topic membership.
+    """
+
+    event_id: str
+    topic: str
     created: list[TaskRef]
     duplicates: list[TaskRef]
 

@@ -1,4 +1,4 @@
-"""FastAPI application: subscription management, event ingestion, status queries."""
+"""FastAPI application: subscription management, topic publishing, event ingestion, status queries."""
 from __future__ import annotations
 
 import asyncio
@@ -30,6 +30,10 @@ from .schemas import (
     SecretRotationCreate,
     SubscriptionCreate,
     SubscriptionOut,
+    SubscriptionTopicsOut,
+    SubscriptionTopicsUpdate,
+    TopicEventAccepted,
+    TopicEventCreate,
 )
 from .worker import worker_loop
 
@@ -297,6 +301,35 @@ def delete_rate_policy(sub_id: str) -> Response:
 
 
 # ----------------------------------------------------------------------
+# subscription topics
+# ----------------------------------------------------------------------
+@app.put("/subscriptions/{sub_id}/topics", response_model=SubscriptionTopicsOut)
+def put_subscription_topics(sub_id: str, body: SubscriptionTopicsUpdate) -> dict:
+    """Replace a subscription's topic set (deduplicated, atomic).
+
+    The whole set is swapped in a single transaction, so a concurrent
+    POST /topic-events publish snapshots either the old or the new set in
+    full, never a mix. Duplicates and ordering in the request are
+    normalized away: the stored set is returned sorted. An empty list
+    unsubscribes the subscription from every topic. The set is persisted,
+    so it survives restarts.
+    """
+    topics = app.state.db.set_subscription_topics(sub_id, body.topics)
+    if topics is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return {"subscription_id": sub_id, "topics": topics}
+
+
+@app.get("/subscriptions/{sub_id}/topics", response_model=SubscriptionTopicsOut)
+def get_subscription_topics(sub_id: str) -> dict:
+    """Return the subscription's current (sorted, deduplicated) topic set."""
+    topics = app.state.db.get_subscription_topics(sub_id)
+    if topics is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return {"subscription_id": sub_id, "topics": topics}
+
+
+# ----------------------------------------------------------------------
 # events
 # ----------------------------------------------------------------------
 @app.post("/events", response_model=EventAccepted)
@@ -340,6 +373,44 @@ def submit_event(body: EventCreate, response: Response) -> dict:
 
     response.status_code = 201 if created else 200
     return {"event_id": body.event_id, "created": created, "duplicates": duplicates}
+
+
+# ----------------------------------------------------------------------
+# topic events
+# ----------------------------------------------------------------------
+@app.post("/topic-events", response_model=TopicEventAccepted)
+def publish_topic_event(body: TopicEventCreate, response: Response) -> dict:
+    """Publish an event to a topic's current subscribers.
+
+    In a single SQLite transaction the topic's subscribers are snapshotted
+    and one ordinary delivery task per subscriber is created, so the
+    existing ordered, rate-limited, circuit-broken and retried delivery
+    pipeline applies unchanged. The acceptance receipt (recipients and
+    their task ids) is persisted with the event:
+
+    - replaying the same event_id + topic + payload returns the original
+      receipt (200) exactly, even if topic membership has changed since --
+      no task is ever added or lost on replay;
+    - the same event_id with a different topic or payload is rejected
+      with 409;
+    - a topic with no current subscribers is rejected with 422 and
+      nothing is stored, so the event_id can be published again once the
+      topic has members.
+    """
+    payload = json.dumps(body.payload, separators=(",", ":"), ensure_ascii=False)
+    status, receipt = app.state.db.publish_topic_event(
+        body.event_id, body.topic, payload, config.MAX_ATTEMPTS
+    )
+    if status == "conflict":
+        raise HTTPException(
+            409,
+            f"event {body.event_id!r} already exists with a different topic or payload",
+        )
+    if status == "empty":
+        raise HTTPException(422, f"topic {body.topic!r} currently has no subscribers")
+    # Replays return the stored first receipt and never create tasks.
+    response.status_code = 201 if status == "created" else 200
+    return receipt
 
 
 # ----------------------------------------------------------------------
